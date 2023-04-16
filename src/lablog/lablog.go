@@ -59,7 +59,7 @@ func init() {
 }
 
 func Debug(serverId int, topic LogTopic, format string, a ...interface{}) {
-	if debugVerbosity == 0 {
+	if debugVerbosity == 0 && topic != Log && topic != Heart {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
 		prefix := fmt.Sprintf("%06d %v ", time, string(topic))

@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 
 	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,13 @@ import (
 // in part 2D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
+func dTopicOfAppendEntriesRPC(args *AppendEntriesArgs, defaultTopic lablog.LogTopic) lablog.LogTopic {
+	if len(args.Entries) == 0 {
+		return lablog.Heart
+	}
+	return defaultTopic
+}
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -96,9 +104,17 @@ type Raft struct {
 }
 
 type LogEntry struct {
-	LogIndex int
-	Term     int
-	Command  interface{}
+	Index   int
+	Term    int
+	Command interface{}
+}
+
+func (e LogEntry) String() string {
+	commandStr := fmt.Sprintf("%v", e.Command)
+	if len(commandStr) > 15 {
+		commandStr = commandStr[:15]
+	}
+	return fmt.Sprintf("{I:%d T:%d C:%s}", e.Index, e.Term, commandStr)
 }
 
 // return currentTerm and whether this server
@@ -138,34 +154,12 @@ func (rf *Raft) persist() {
 		lablog.Debug(rf.me, lablog.Persist, "Saved state T:%d VF:%d, (LII:%d LIT:%d), (LLI:%d LLT:%d)", rf.CurrentTerm, rf.VotedFor, rf.LastIncludedIndex, rf.LastIncludedTerm, lastLogIndex, lastLogTerm)
 		rf.persister.SaveRaftState(data)
 	}
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
 	if len(data) == 0 { // bootstrap without any state
 		return
 	}
@@ -303,14 +297,35 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 
 	// Your code here (2B).
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.CurrentTerm
+	if rf.State != LEADER || rf.killed() {
+		return
+	}
+	index = rf.NextIndex[rf.me]
+	isLeader = true
+	rf.Log = append(rf.Log, LogEntry{
+		Index:   index,
+		Term:    term,
+		Command: command,
+	})
+	rf.NextIndex[rf.me]++
+	rf.MatchIndex[rf.me] = index
+	lablog.Debug(rf.me, lablog.Log2, "Received log: %v, with NI:%v, MI:%v", rf.Log[len(rf.Log)-1], rf.NextIndex, rf.MatchIndex)
+	rf.persist()
+	for i, c := range rf.AppendEntriesChan {
+		if i != rf.me {
+			select {
+			case c <- 0:
+			default:
+			}
+		}
+	}
+	return
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -324,6 +339,40 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	// Your code here, if desired.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// to terminate all long-run goroutines
+	// quit entriesAppender
+	for _, c := range rf.AppendEntriesChan {
+		if c != nil {
+			close(c)
+		}
+	}
+	// IMPORTANT: not just close channels, but also need to reset appendEntriesCh to avoid send to closed channel
+	rf.AppendEntriesChan = nil
+
+	// quit snapshotInstaller
+	// for _, c := range rf.installSnapshotCh {
+	// 	if c != nil {
+	// 		close(c)
+	// 	}
+	// }
+	// // IMPORTANT: not just close channels, but also need to reset installSnapshotCh to avoid send to closed channel
+	// rf.installSnapshotCh = nil
+
+	// quit committer
+	if rf.CommitTrigger != nil {
+		close(rf.CommitTrigger)
+	}
+	// IMPORTANT: not just close channels, but also need to reset CommitTrigger to avoid send to closed channel
+	rf.CommitTrigger = nil
+
+	// quit snapshoter
+	// close(rf.snapshotTrigger)
+	// // IMPORTANT: not just close channels, but also need to reset snapshotTrigger to avoid send to closed channel
+	// rf.snapshotTrigger = nil
 	// Your code here, if desired.
 }
 
@@ -359,6 +408,7 @@ func (rf *Raft) ticker() {
 				rf.State = CANDIDATE
 				rf.persist()
 
+				lablog.Debug(rf.me, lablog.Timer, "Resetting ELT because election")
 				rf.ElectionAlarm = nextElectionAlarm()
 				sleepDuration = time.Until(rf.ElectionAlarm)
 
@@ -419,7 +469,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.CommitIndex = 0
 	rf.LastApplied = 0
 	rf.State = FOLLOWER
-	rf.ElectionAlarm = nextElectionAlarm()
+	rf.ElectionAlarm = time.Now().Add(time.Duration(labutil.RandRange(0, electionTimeoutMax-electionTimeoutMin)) * time.Millisecond)
 
 	rf.NextIndex = nil
 	rf.MatchIndex = nil
@@ -433,7 +483,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	lastLogIndex, lastLogTerm := rf.lastLogIndexAndTerm()
-	lablog.Debug(rf.me, lablog.Client, "Started at T:%d with (LLI:%d LLT:%d)", rf.CurrentTerm, lastLogIndex, lastLogTerm)
+
+	lablog.Debug(rf.me, lablog.Client, "Started at T:%d with (LII:%d LIT:%d), (LLI:%d LLT:%d)", rf.CurrentTerm, rf.LastIncludedIndex, rf.LastIncludedTerm, lastLogIndex, lastLogTerm)
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
@@ -441,30 +492,60 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) commiter(applyCh chan ApplyMsg, commitTrigger chan bool) {
+func (rf *Raft) commiter(applyCh chan ApplyMsg, triggerCh chan bool) {
 
 	defer func() {
+		// IMPORTANT: close channel to avoid resource leak
 		close(applyCh)
-		<-commitTrigger
+		// IMPORTANT: drain CommitTrigger to avoid goroutine resource leak
+		for i := 0; i < len(triggerCh); i++ {
+			<-triggerCh
+		}
 	}()
 
 	for !rf.killed() {
-		isCommit, ok := <-commitTrigger
+		isCommit, ok := <-triggerCh
 
 		if !ok {
 			return
 		}
 		rf.mu.Lock()
+		if !isCommit {
+			// re-enable commitTrigger to be ready to accept commit signal
+			rf.CommitTrigger = triggerCh
+			// is received snapshot from leader
+			data := rf.persister.ReadSnapshot()
+			if rf.LastIncludedIndex == 0 || len(data) == 0 {
+				// snapshot data invalid
+				rf.mu.Unlock()
+				continue
+			}
 
+			// send snapshot back to upper-level service
+			applyMsg := ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      data,
+				SnapshotIndex: rf.LastIncludedIndex,
+				SnapshotTerm:  rf.LastIncludedTerm,
+			}
+			rf.mu.Unlock()
+
+			applyCh <- applyMsg
+			continue
+		}
 		//如果是commit，那么就把log中的command发送到applyCh中
-		for isCommit && rf.CommitTrigger != nil && rf.LastApplied < rf.CommitIndex {
+		for rf.CommitTrigger != nil && rf.LastApplied < rf.CommitIndex {
 			rf.LastApplied++
 			//在这里加锁，是因为在这里会有多个goroutine同时访问applyCh
+			logEntry := rf.Log[rf.LastApplied-1]
+			//? 为什么要减1
+			lablog.Debug(rf.me, lablog.Client, "CI:%d > LA:%d, apply log: %s", rf.CommitIndex, rf.LastApplied-1, logEntry)
 			rf.mu.Unlock()
 			applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      rf.Log[rf.LastApplied].Command,
-				CommandIndex: rf.LastApplied,
+				Command:      logEntry.Command,
+				CommandIndex: logEntry.Index,
 			}
 
 			rf.mu.Lock()
@@ -493,7 +574,7 @@ func (rf *Raft) ifMyLogMoreUpToDate(index int, term int) bool {
 	// then the log with the later term is more up-to-date
 	myindex, myterm := 0, 0
 	if l := len(rf.Log); l > 0 {
-		myindex, myterm = rf.Log[l-1].LogIndex, rf.Log[l-1].Term
+		myindex, myterm = rf.Log[l-1].Index, rf.Log[l-1].Term
 	}
 
 	if myterm != term {
@@ -528,9 +609,12 @@ func (rf *Raft) pre_sendRequestVote(term int, server int, args *RequestVoteArgs,
 		return
 	}
 	if !ret {
+		lablog.Debug(rf.me, lablog.Drop, "-> S%d RV been dropped: {T:%d LLI:%d LLT:%d}", server, args.Term, args.LastLogIndex, args.LastLogTerm)
 		return
 	}
 	if reply.Term > rf.CurrentTerm {
+
+		lablog.Debug(rf.me, lablog.Term, "RV <- S%d Term is higher(%d > %d), following", server, reply.Term, rf.CurrentTerm)
 		rf.toFollower(reply.Term)
 		return
 	}
@@ -539,13 +623,14 @@ func (rf *Raft) pre_sendRequestVote(term int, server int, args *RequestVoteArgs,
 		return
 	}
 	granted = reply.VoteGranted
+	lablog.Debug(rf.me, lablog.Vote, "<- S%d Got Vote: %t, at T%d", server, granted, term)
 
 }
 func (rf *Raft) lastLogIndexAndTerm() (index, term int) {
 	index = 0
 	term = 0
 	if l := len(rf.Log); l > 0 {
-		index, term = rf.Log[l-1].LogIndex, rf.Log[l-1].Term
+		index, term = rf.Log[l-1].Index, rf.Log[l-1].Term
 	}
 	return index, term
 }
@@ -571,7 +656,7 @@ func (rf *Raft) collectVote(term int, grant chan bool) {
 			} else {
 				//成为leader
 				rf.State = LEADER
-				lablog.Debug(rf.me, lablog.Leader, "Achieved Majority for T%d, converting to Leader, NI:%v, MI:%v", rf.CurrentTerm, rf.NextIndex, rf.MatchIndex)
+
 				rf.NextIndex = make([]int, len(rf.peers))
 				rf.MatchIndex = make([]int, len(rf.peers))
 				lastlogIndex, _ := rf.lastLogIndexAndTerm()
@@ -590,7 +675,7 @@ func (rf *Raft) collectVote(term int, grant chan bool) {
 					}
 				}
 				go rf.leaderTicker(rf.CurrentTerm)
-
+				lablog.Debug(rf.me, lablog.Leader, "Achieved Majority for T%d, converting to Leader, NI:%v, MI:%v", rf.CurrentTerm, rf.NextIndex, rf.MatchIndex)
 				rf.mu.Unlock()
 
 			}
@@ -611,6 +696,7 @@ func (rf *Raft) leaderTicker(term int) {
 		}
 
 		//每隔ms发送一次心跳
+		lablog.Debug(rf.me, lablog.Timer, "Leader at T%d, broadcasting heartbeats", term)
 		for i, c := range rf.AppendEntriesChan {
 			if i != rf.me {
 				select {
@@ -683,6 +769,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	ret := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ret
 }
+func intentOfAppendEntriesRPC(args *AppendEntriesArgs) string {
+	if len(args.Entries) == 0 {
+		return "HB"
+	}
+	return "AE"
+}
 
 /********************** AppendEntries RPC handler *****************************/
 
@@ -699,11 +791,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	//如果收到的term比自己的term大，那么就转换成follower
 	if args.Term > rf.CurrentTerm {
+		lablog.Debug(rf.me, lablog.Term, "S%d %s request term is higher(%d > %d), following", args.LeaderId, intentOfAppendEntriesRPC(args), args.Term, rf.CurrentTerm)
 		rf.toFollower(args.Term)
 	}
 
 	// 可能是上一步的 stepDown 造成的，也可能是自己本身就是 Candidate
 	if rf.State == CANDIDATE && args.Term >= rf.CurrentTerm {
+		lablog.Debug(rf.me, lablog.Term, "I'm Candidate, S%d %s request term %d >= %d, following", args.LeaderId, intentOfAppendEntriesRPC(args), args.Term, rf.CurrentTerm)
 		rf.toFollower(args.Term)
 	}
 	//收到AE后，重置选举超时时间
@@ -732,7 +826,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// trim args.Entries to start after LastIncludedIndex
 		sameEntryInArgsEntries := false
 		for i := range args.Entries {
-			if args.Entries[i].LogIndex == 0 && args.Entries[i].Term == 0 {
+			if args.Entries[i].Index == 0 && args.Entries[i].Term == 0 {
 				sameEntryInArgsEntries = true
 				args.Entries = args.Entries[i+1:]
 				break
@@ -754,7 +848,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictTerm = prevLogTerm
 
 		for i := args.PrevLogIndex - 1; i >= 0; i-- {
-			reply.ConflictIndex = rf.Log[i].LogIndex
+			reply.ConflictIndex = rf.Log[i].Index
 			if rf.Log[i].Term != prevLogTerm {
 
 				break
@@ -766,6 +860,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//如果收到的AE中的entries不为空，那么就更新自己的log
 	if len(args.Entries) > 0 {
 		//从prevLogIndex开始，向后查找，找到第一个不同的entry
+		lablog.Debug(rf.me, lablog.Info, "Received: %v from S%d at T%d", args.Entries, args.LeaderId, args.Term)
 		log_from_prev := rf.Log[args.PrevLogIndex:]
 		var i int
 		needsave := false
@@ -780,6 +875,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//两种情况，一种是从prevLogIndex开始，自己的log和收到的log完全一样，那么就直接追加收到的log
 		//一种情况是从prevLogIndex开始，存在不同的项，但是已经在上面删除了，那么就直接追加收到的log
 		if i < len(args.Entries) {
+			lablog.Debug(rf.me, lablog.Info, "Append new: %v from i: %d", args.Entries[i:], i)
 			rf.Log = append(rf.Log, args.Entries[i:]...)
 			needsave = true
 		}
@@ -791,7 +887,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommit > rf.CommitIndex {
-		rf.CommitIndex = labutil.Min(args.LeaderCommit, len(rf.Log)-1)
+		lastLogIndex, _ := rf.lastLogIndexAndTerm()
+		rf.CommitIndex = labutil.Min(args.LeaderCommit, lastLogIndex)
 		select {
 		case rf.CommitTrigger <- true:
 		default:
@@ -819,19 +916,21 @@ func (rf *Raft) updateCommitIndex(term int) {
 		return
 	}
 	oldCommitIndex := rf.CommitIndex
-	for N := rf.CommitIndex + 1; N < len(rf.Log); N++ {
 
-		//这里的matchIndex是从0开始的，所以要加1
-		count := 1
-		for i := 0; i < len(rf.peers); i++ {
-			if rf.MatchIndex[i] >= N {
-				count++
+	for N := rf.CommitIndex + 1; N < len(rf.Log)+1; N++ {
+		if rf.Log[N-1].Term == term {
+			//这里的matchIndex是从0开始的，所以要加1
+			count := 1
+			for i := 0; i < len(rf.peers); i++ {
+				if i != rf.me && rf.MatchIndex[i] >= N {
+					count++
+				}
 			}
-		}
-		if count > len(rf.peers)/2 && rf.Log[N].Term == rf.CurrentTerm {
-			lablog.Debug(rf.me, lablog.Commit, "Commit achieved majority, set CI from %d to %d", rf.CommitIndex, N)
-			rf.CommitIndex = N
-			// rf.applyCond.Signal()
+			if count > len(rf.peers)/2 {
+				lablog.Debug(rf.me, lablog.Commit, "Commit achieved majority, set CI from %d to %d", rf.CommitIndex, N)
+				rf.CommitIndex = N
+				// rf.applyCond.Signal()
+			}
 		}
 
 	}
@@ -855,9 +954,9 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 	if rf.State != LEADER || rf.CurrentTerm != term || rf.killed() {
 		return
 	}
-	rpcIntent := ""
+	rpcIntent := intentOfAppendEntriesRPC(args)
 	if !ret {
-		if len(args.Entries) == 0 {
+		if rpcIntent == "HB" {
 			// OPTIMIZATION: don't retry heartbeat rpc
 			return
 		}
@@ -871,13 +970,7 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 		select {
 		//申请重发
 		case rf.AppendEntriesChan[server] <- serialNo: // retry with serialNo
-
-			if len(args.Entries) == 0 {
-				rpcIntent = "HB"
-			} else {
-				rpcIntent = "APPENDENTRIES"
-			}
-			// lablog.Debug(rf.me, lablog.Drop, "-> S%d %s been dropped: {T:%d PLI:%d PLT:%d LC:%d log length:%d}, retry", server, rpcIntent, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
+			lablog.Debug(rf.me, lablog.Drop, "-> S%d %s been dropped: {T:%d PLI:%d PLT:%d LC:%d log length:%d}, retry", server, rpcIntent, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
 			// lablog.Debug(rf.me, lablog.Drop, "-> S%d %s been dropped: {T:%d PLI:%d PLT:%d LC:%d log length:%d}, retry", server, rpcIntent, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
 		default:
 		}
@@ -885,6 +978,7 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 
 	}
 	// lablog.Debug(rf.me, lablog.Info, "%s <- S%d Reply: %+v", rpcIntent, server, *reply)
+	lablog.Debug(rf.me, dTopicOfAppendEntriesRPC(args, lablog.Log), "%s <- S%d Reply: %+v", rpcIntent, server, *reply)
 	//如果答复的server的term大于自己的term，那么就变成follower
 	if reply.Term > rf.CurrentTerm {
 		lablog.Debug(rf.me, lablog.Term, "%s <- S%d Term is higher(%d > %d), following", rpcIntent, server, reply.Term, rf.CurrentTerm)
@@ -892,7 +986,7 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 		rf.ElectionAlarm = nextElectionAlarm()
 		return
 	}
-	// //可能是上一步发送chanshen，所以要再判断一下
+	//可能是上一步发送chanshen，所以要再判断一下
 	if rf.CurrentTerm != term {
 		return
 	}
@@ -902,10 +996,14 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 
 		rf.NextIndex[server] = labutil.Max(args.PrevLogIndex+len(args.Entries)+1, rf.NextIndex[server])
 		rf.MatchIndex[server] = labutil.Max(args.PrevLogIndex+len(args.Entries), rf.MatchIndex[server])
+		lablog.Debug(rf.me, dTopicOfAppendEntriesRPC(args, lablog.Log), "%s RPC -> S%d success, updated NI:%v, MI:%v", rpcIntent, server, rf.NextIndex, rf.MatchIndex)
 		// lablog.Debug(rf.me, lablog.Info, "%s RPC -> S%d success, updated NI:%v, MI:%v", rpcIntent, server, rf.NextIndex, rf.MatchIndex)
 		// rf.NextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 		// rf.MatchIndex[server] = rf.NextIndex[server] - 1
 		go rf.updateCommitIndex(term)
+
+		//及时ruturn
+		return
 	}
 
 	if reply.XLen != 0 && reply.ConflictTerm == 0 {
@@ -917,7 +1015,7 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 			if i < 0 {
 				entryIndex, entryTerm = rf.lastLogIndexAndTerm()
 			} else {
-				entryIndex, entryTerm = rf.Log[i].LogIndex, rf.Log[i].Term
+				entryIndex, entryTerm = rf.Log[i].Index, rf.Log[i].Term
 			}
 
 			if entryTerm == reply.ConflictTerm {
