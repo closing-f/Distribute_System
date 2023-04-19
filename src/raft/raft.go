@@ -72,8 +72,14 @@ const heartInterval = 100
 const electionTimeoutMax = 1200
 const electionTimeoutMin = 800
 
+const leaderKeepLogAmount = 20
+
+type snapshotCmd struct {
+	Index    int
+	Snapshot []byte
+}
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state //?什么时候会出现共享访问
+	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -99,6 +105,13 @@ type Raft struct {
 	NextIndex         []int
 	MatchIndex        []int
 	AppendEntriesChan []chan int //用于leader等待follower的回复
+
+	// for snapshot
+
+	SnapshotTrigger     chan bool
+	SnapshotCh          chan snapshotCmd //存有snapshot的channel
+	InstallSnapshotChan []chan int       //用于leader等待follower的回复
+
 	LastIncludedIndex int
 	LastIncludedTerm  int
 }
@@ -198,7 +211,10 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	select {
+	case rf.SnapshotCh <- snapshotCmd{index, snapshot}:
+	default:
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -352,15 +368,18 @@ func (rf *Raft) Kill() {
 	}
 	// IMPORTANT: not just close channels, but also need to reset appendEntriesCh to avoid send to closed channel
 	rf.AppendEntriesChan = nil
+	for _, c := range rf.InstallSnapshotChan {
+		if c != nil {
+			close(c)
+		}
+	}
+	// IMPORTANT: not just close channels, but also need to reset installSnapshotCh to avoid send to closed channel
+	rf.InstallSnapshotChan = nil
 
-	// quit snapshotInstaller
-	// for _, c := range rf.installSnapshotCh {
-	// 	if c != nil {
-	// 		close(c)
-	// 	}
-	// }
-	// // IMPORTANT: not just close channels, but also need to reset installSnapshotCh to avoid send to closed channel
-	// rf.installSnapshotCh = nil
+	// quit snapshoter
+	close(rf.SnapshotTrigger)
+	// IMPORTANT: not just close channels, but also need to reset snapshotTrigger to avoid send to closed channel
+	rf.SnapshotTrigger = nil
 
 	// quit committer
 	if rf.CommitTrigger != nil {
@@ -478,10 +497,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.LastIncludedTerm = 0
 
 	rf.CommitTrigger = make(chan bool, 1)
+
+	// snapshot
+	rf.SnapshotTrigger = make(chan bool, 1)
+	rf.SnapshotCh = make(chan snapshotCmd, 1)
+	rf.InstallSnapshotChan = nil
+
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.CommitIndex = rf.LastIncludedIndex
+	rf.LastApplied = rf.LastIncludedIndex
+
 	lastLogIndex, lastLogTerm := rf.lastLogIndexAndTerm()
 
 	lablog.Debug(rf.me, lablog.Client, "Started at T:%d with (LII:%d LIT:%d), (LLI:%d LLT:%d)", rf.CurrentTerm, rf.LastIncludedIndex, rf.LastIncludedTerm, lastLogIndex, lastLogTerm)
@@ -489,6 +518,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	go rf.commiter(applyCh, rf.CommitTrigger)
+
+	go rf.snapshoter(rf.SnapshotTrigger)
 	return rf
 }
 
@@ -538,8 +569,7 @@ func (rf *Raft) commiter(applyCh chan ApplyMsg, triggerCh chan bool) {
 		for rf.CommitTrigger != nil && rf.LastApplied < rf.CommitIndex {
 			rf.LastApplied++
 			//在这里加锁，是因为在这里会有多个goroutine同时访问applyCh
-			logEntry := rf.Log[rf.LastApplied-1]
-			//? 为什么要减1
+			logEntry := rf.Log[rf.LastApplied-1-rf.LastIncludedIndex]
 			lablog.Debug(rf.me, lablog.Client, "CI:%d > LA:%d, apply log: %s", rf.CommitIndex, rf.LastApplied-1, logEntry)
 			rf.mu.Unlock()
 			applyCh <- ApplyMsg{
@@ -565,22 +595,33 @@ func (rf *Raft) toFollower(term int) {
 		}
 	}
 	rf.AppendEntriesChan = nil
+
+	for _, c := range rf.InstallSnapshotChan {
+		if c != nil {
+			close(c)
+		}
+	}
+	rf.InstallSnapshotChan = nil
+
 	rf.persist()
 	rf.NextIndex = nil
 	rf.MatchIndex = nil
+	select {
+	case rf.SnapshotTrigger <- true:
+	default:
+	}
 }
 func (rf *Raft) ifMyLogMoreUpToDate(index int, term int) bool {
 	// If the logs have last entries with different terms,
 	// then the log with the later term is more up-to-date
-	myindex, myterm := 0, 0
-	if l := len(rf.Log); l > 0 {
-		myindex, myterm = rf.Log[l-1].Index, rf.Log[l-1].Term
+	myLastLogIndex, myLastLogTerm := rf.lastLogIndexAndTerm()
+	if myLastLogTerm != term {
+		return myLastLogTerm > term
 	}
 
-	if myterm != term {
-		return myterm > term
-	}
-	return myindex > index
+	// If the logs end with the same term,
+	// then whichever log is longer is more up-to-date
+	return myLastLogIndex > index
 }
 func (rf *Raft) pre_sendRequestVote(term int, server int, args *RequestVoteArgs, grant chan bool) {
 
@@ -627,12 +668,11 @@ func (rf *Raft) pre_sendRequestVote(term int, server int, args *RequestVoteArgs,
 
 }
 func (rf *Raft) lastLogIndexAndTerm() (index, term int) {
-	index = 0
-	term = 0
+	index, term = rf.LastIncludedIndex, rf.LastIncludedTerm
 	if l := len(rf.Log); l > 0 {
 		index, term = rf.Log[l-1].Index, rf.Log[l-1].Term
 	}
-	return index, term
+	return
 }
 func (rf *Raft) collectVote(term int, grant chan bool) {
 
@@ -674,6 +714,17 @@ func (rf *Raft) collectVote(term int, grant chan bool) {
 						// TODO go rf.sendAppendEntries(i)
 					}
 				}
+
+				//snapshot
+				rf.InstallSnapshotChan = make([]chan int, len(rf.peers))
+				for i := 0; i < len(rf.peers); i++ {
+					if i != rf.me {
+						rf.InstallSnapshotChan[i] = make(chan int, 1)
+
+						go rf.snapshotInstaller(i, rf.InstallSnapshotChan[i], rf.CurrentTerm)
+					}
+				}
+
 				go rf.leaderTicker(rf.CurrentTerm)
 				lablog.Debug(rf.me, lablog.Leader, "Achieved Majority for T%d, converting to Leader, NI:%v, MI:%v", rf.CurrentTerm, rf.NextIndex, rf.MatchIndex)
 				rf.mu.Unlock()
@@ -742,9 +793,9 @@ func (rf *Raft) constructAppenderArgs(server int) *AppendEntriesArgs {
 	//新日志的前一条日志的index
 	args.PrevLogIndex = rf.NextIndex[server] - 1
 	// prevLogIndex := rf.nextIndex[server] - 1
-	args.PrevLogTerm = 0
-
-	if i := args.PrevLogIndex - 1; i > -1 {
+	args.PrevLogTerm = rf.LastIncludedTerm
+	//? 为什么要减1,可能是因为rf.Log的第一条日志的index是1
+	if i := args.PrevLogIndex - rf.LastIncludedIndex - 1; i > -1 {
 		args.PrevLogTerm = rf.Log[i].Term
 	}
 
@@ -752,12 +803,15 @@ func (rf *Raft) constructAppenderArgs(server int) *AppendEntriesArgs {
 	//leader日志的最后一条日志的index比follower的小，那么就不用发送日志了
 	if lastlogIndex, _ := rf.lastLogIndexAndTerm(); lastlogIndex <= args.PrevLogIndex {
 		entries = nil
-	} else if args.PrevLogIndex >= 0 {
-
-		newEntries := rf.Log[args.PrevLogIndex:]
+	} else if args.PrevLogIndex >= rf.LastIncludedIndex {
+		//从NextIndex开始发送日志
+		newEntries := rf.Log[args.PrevLogIndex+1-rf.LastIncludedIndex-1:]
 		entries = make([]LogEntry, len(newEntries))
 		// avoid data-race
 		copy(entries, newEntries)
+	} else {
+		//如果PrevLogIndex比LastIncludedIndex小，那么就不用发送日志了,因为这些日志已经被snapshot了
+		entries = nil
 	}
 
 	// args.PrevLogTerm = rf.Log[args.PrevLogIndex].Term
@@ -815,18 +869,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// prevLogTerm := rf.Log[args.PrevLogIndex].Term
 	var prevLogTerm int
 	switch {
-	case args.PrevLogIndex == 0:
-		prevLogTerm = 0
-	case args.PrevLogIndex < 0:
+	case args.PrevLogIndex == rf.LastIncludedIndex:
+		prevLogTerm = rf.LastIncludedTerm
+	case args.PrevLogIndex < rf.LastIncludedIndex:
 		// follower has committed PrevLogIndex log =>
 		// PrevLogIndex consistency check is already done =>
 		// it's OK to start log consistency check at 0
-		args.PrevLogIndex = 0
-		prevLogTerm = 0
+		args.PrevLogIndex = rf.LastIncludedIndex
+		prevLogTerm = rf.LastIncludedTerm
+
 		// trim args.Entries to start after LastIncludedIndex
 		sameEntryInArgsEntries := false
 		for i := range args.Entries {
-			if args.Entries[i].Index == 0 && args.Entries[i].Term == 0 {
+			if args.Entries[i].Index == rf.LastIncludedIndex && args.Entries[i].Term == rf.LastIncludedTerm {
 				sameEntryInArgsEntries = true
 				args.Entries = args.Entries[i+1:]
 				break
@@ -841,13 +896,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	default:
 		// args.PrevLogIndex > rf.LastIncludedIndex
-		prevLogTerm = rf.Log[args.PrevLogIndex-1].Term
+		prevLogTerm = rf.Log[args.PrevLogIndex-rf.LastIncludedIndex-1].Term
 	}
 
 	if prevLogTerm != args.PrevLogTerm {
 		reply.ConflictTerm = prevLogTerm
 
-		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+		for i := args.PrevLogIndex - 1 - rf.LastIncludedIndex; i >= 0; i-- {
 			reply.ConflictIndex = rf.Log[i].Index
 			if rf.Log[i].Term != prevLogTerm {
 
@@ -859,15 +914,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	//如果收到的AE中的entries不为空，那么就更新自己的log
 	if len(args.Entries) > 0 {
-		//从prevLogIndex开始，向后查找，找到第一个不同的entry
+		//从prevLogIndex+1对应的logEntry开始，向后查找，找到第一个不同的entry
 		lablog.Debug(rf.me, lablog.Info, "Received: %v from S%d at T%d", args.Entries, args.LeaderId, args.Term)
-		log_from_prev := rf.Log[args.PrevLogIndex:]
+		log_from_prev := rf.Log[args.PrevLogIndex-rf.LastIncludedIndex:]
 		var i int
 		needsave := false
 		for i = 0; i < len(args.Entries) && i < len(log_from_prev); i++ {
 			if args.Entries[i].Term != log_from_prev[i].Term {
 				//如果不同，那么就删除自己的log中从prevLogIndex开始的所有entry
-				rf.Log = rf.Log[:args.PrevLogIndex+i]
+				rf.Log = rf.Log[:args.PrevLogIndex-rf.LastIncludedIndex+i]
 				needsave = true
 				break
 			}
@@ -917,8 +972,8 @@ func (rf *Raft) updateCommitIndex(term int) {
 	}
 	oldCommitIndex := rf.CommitIndex
 
-	for N := rf.CommitIndex + 1; N < len(rf.Log)+1; N++ {
-		if rf.Log[N-1].Term == term {
+	for N := rf.CommitIndex + 1; N < len(rf.Log)+1+rf.LastIncludedIndex; N++ {
+		if rf.Log[N-rf.LastIncludedIndex-1].Term == term {
 			//这里的matchIndex是从0开始的，所以要加1
 			count := 1
 			for i := 0; i < len(rf.peers); i++ {
@@ -993,7 +1048,7 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 	if reply.Success {
 		//如果成功，那么就更新NextIndex和MatchIndex
 		//args.Entries被发送的时候，是从rf.nextIndex[server]开始的，所以这里要加上len(args.Entries)
-
+		oldNextIndex := rf.NextIndex[server]
 		rf.NextIndex[server] = labutil.Max(args.PrevLogIndex+len(args.Entries)+1, rf.NextIndex[server])
 		rf.MatchIndex[server] = labutil.Max(args.PrevLogIndex+len(args.Entries), rf.MatchIndex[server])
 		lablog.Debug(rf.me, dTopicOfAppendEntriesRPC(args, lablog.Log), "%s RPC -> S%d success, updated NI:%v, MI:%v", rpcIntent, server, rf.NextIndex, rf.MatchIndex)
@@ -1002,9 +1057,18 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 		// rf.MatchIndex[server] = rf.NextIndex[server] - 1
 		go rf.updateCommitIndex(term)
 
+		if oldNextIndex < rf.NextIndex[server] {
+			select {
+			case rf.SnapshotTrigger <- true:
+			default:
+			}
+		}
+
 		//及时ruturn
 		return
 	}
+
+	needToInstallSnapshot := false
 
 	if reply.XLen != 0 && reply.ConflictTerm == 0 {
 		// follower's log is too short
@@ -1028,15 +1092,26 @@ func (rf *Raft) appendEntries(server int, args *AppendEntriesArgs, term int, ser
 				rf.NextIndex[server] = reply.ConflictIndex
 				break
 			}
+			if i < 0 {
+				needToInstallSnapshot = true
+				rf.NextIndex[server] = rf.LastIncludedIndex + 1
+				break
+			}
 
 		}
 	}
-
-	select {
-	case rf.AppendEntriesChan[server] <- 0: // retry with serialNo
-		// lablog.Debug(rf.me, lablog.Drop, "-> S%d %s been dropped: {T:%d PLI:%d PLT:%d LC:%d log length:%d}, retry", server, rpcIntent, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
-	default:
-		// lablog.Debug(rf.me, lablog.Drop, "-> S%d %s been dropped: {T:%d PLI:%d PLT:%d LC:%d log length:%d}, retry", server, rpcIntent, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
+	if needToInstallSnapshot || rf.NextIndex[server] <= rf.LastIncludedIndex {
+		select {
+		case rf.InstallSnapshotChan[server] <- 0:
+		default:
+		}
+	} else {
+		select {
+		case rf.AppendEntriesChan[server] <- 0: // retry with serialNo
+			// lablog.Debug(rf.me, lablog.Drop, "-> S%d %s been dropped: {T:%d PLI:%d PLT:%d LC:%d log length:%d}, retry", server, rpcIntent, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
+		default:
+			// lablog.Debug(rf.me, lablog.Drop, "-> S%d %s been dropped: {T:%d PLI:%d PLT:%d LC:%d log length:%d}, retry", server, rpcIntent, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, len(args.Entries))
+		}
 	}
 
 }
@@ -1060,10 +1135,20 @@ func (rf *Raft) entriesAppender(server int, ch <-chan int, term int) {
 			return
 		}
 		args := rf.constructAppenderArgs(server)
+		//如果args为nil，那么就说明没有需要发送的日志，那么就发送InstallSnapshot RPC
+		if args == nil {
+			select {
+			case rf.InstallSnapshotChan[server] <- 0:
+				lablog.Debug(rf.me, lablog.Snap, "-> S%d cannot AE, going to IS", server)
 
+			default:
+			}
+			rf.mu.Unlock()
+			continue
+		}
 		rf.mu.Unlock()
 
-		if serialNo == 0 || serialNo >= i {
+		if serialNo == 0 || serialNo >= i { //? 这里的serialNo在重试时会返回serialNo,这样不会出现i比serialNo小的情况
 			go rf.appendEntries(server, args, term, i)
 			i++ //发送次数加1
 		}
@@ -1073,4 +1158,258 @@ func (rf *Raft) entriesAppender(server int, ch <-chan int, term int) {
 
 func nextElectionAlarm() time.Time {
 	return time.Now().Add(time.Duration(labutil.RandRange(electionTimeoutMin, electionTimeoutMax)) * time.Millisecond)
+}
+
+// 每个snapshotInstaller都是一与server绑定的goroutine,用于处理InstallSnapshot RPC
+type InstallSnapshotArgs struct {
+	Term              int    // leader's term
+	LeaderId          int    // so follower can redirect clients
+	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int    // term of LastIncludedIndex
+	Offset            int    // byte offset where chunk is positioned in the snapshot file (not used)
+	Data              []byte // raw bytes of the snapshot chunk, starting at Offset
+	Done              bool   // true if this is the last chunk
+}
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
+func (rf *Raft) snapshotInstaller(server int, ch <-chan int, term int) {
+	var lastArgs *InstallSnapshotArgs
+
+	i := 1 //serialNo
+	currentSnapshotnum := 0
+	for !rf.killed() {
+
+		//等待新的Installsnapshot RPC
+		serialNo, ok := <-ch
+		if !ok {
+			return //如果channel已经关闭，那么就退出
+		}
+		rf.mu.Lock()
+
+		//如果term发生变化，或者不是Leader 那么就不用发送了
+		if rf.State != LEADER || rf.CurrentTerm != term || rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		switch {
+		//lastArgs里面的snapshot过时了，那么就重新构造
+		//一开始的时候lastArgs是nil的，所以这里也会进入
+		case lastArgs == nil || lastArgs.LastIncludedIndex < rf.LastIncludedIndex:
+			lastArgs = rf.constructSnapshotArgs(server)
+			currentSnapshotnum = 1
+			i++
+		//将serialNo与i比较，过时的就不用发送了
+		case serialNo >= i:
+			i++
+		//如果发送的次数超过了3次，那么就不用发送了
+		case rf.LastIncludedIndex == lastArgs.LastIncludedIndex && currentSnapshotnum < 3:
+			currentSnapshotnum++
+		default:
+			rf.mu.Unlock()
+			continue
+		}
+
+		go rf.installSnapshot(server, term, lastArgs, i)
+
+		rf.mu.Unlock()
+	}
+}
+func (rf *Raft) constructSnapshotArgs(server int) *InstallSnapshotArgs {
+	args := &InstallSnapshotArgs{
+		Term:              rf.CurrentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.LastIncludedIndex,
+		LastIncludedTerm:  rf.LastIncludedTerm,
+		Offset:            0,
+		Data:              rf.persister.ReadSnapshot(),
+		Done:              true,
+	}
+	return args
+}
+
+func (rf *Raft) installSnapshot(server int, term int, lastArgs *InstallSnapshotArgs, serialNo int) {
+	reply := &InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(server, lastArgs, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//? 为什么在这里不判断term的变化,而是到后面再判断
+	if rf.State != LEADER || rf.killed() {
+		return
+
+	}
+	if !ok {
+		select {
+		case rf.InstallSnapshotChan[server] <- serialNo:
+			lablog.Debug(rf.me, lablog.Drop, "-> S%d IS been dropped: {T:%d LII:%d LIT:%d}, retry", server, lastArgs.Term, lastArgs.LastIncludedIndex, lastArgs.LastIncludedTerm)
+		default:
+		}
+		return
+	}
+	if reply.Term > rf.CurrentTerm {
+		lablog.Debug(rf.me, lablog.Term, "IS <- S%d Term is higher(%d > %d), following", server, reply.Term, rf.CurrentTerm)
+
+		rf.toFollower(reply.Term)
+		return
+	}
+
+	if rf.CurrentTerm != term {
+		return
+	}
+	//与appendEntries不同,没有冲突的情况
+	//success
+	oldNextIndex := rf.NextIndex[server]
+	rf.NextIndex[server] = labutil.Max(lastArgs.LastIncludedIndex+1, rf.NextIndex[server])
+	rf.MatchIndex[server] = labutil.Max(lastArgs.LastIncludedIndex, rf.MatchIndex[server])
+	lablog.Debug(rf.me, lablog.Snap, "IS RPC -> S%d success, updated NI:%v, MI:%v", server, rf.NextIndex, rf.MatchIndex)
+	if rf.NextIndex[server] > oldNextIndex {
+		select {
+		case rf.SnapshotTrigger <- true:
+		default:
+		}
+	}
+
+}
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.CurrentTerm
+	if args.Term < rf.CurrentTerm || rf.killed() || args.LeaderId == rf.me {
+		return
+	}
+
+	if args.Term > rf.CurrentTerm {
+		lablog.Debug(rf.me, lablog.Term, "S%d IS request term is higher(%d > %d), following", args.LeaderId, args.Term, rf.CurrentTerm)
+
+		rf.toFollower(args.Term)
+
+	}
+
+	lablog.Debug(rf.me, lablog.Timer, "Resetting ELT, received IS from L%d at T%d", args.LeaderId, args.Term)
+	rf.ElectionAlarm = nextElectionAlarm()
+
+	if args.LastIncludedIndex <= rf.LastIncludedIndex ||
+		args.LastIncludedIndex <= rf.LastApplied {
+		//传来的snapshot已经过时了
+		return
+	}
+
+	lablog.Debug(rf.me, lablog.Snap, "Received snapshot from S%d at T%d, with (LII:%d LIT:%d)", args.LeaderId, args.Term, args.LastIncludedIndex, args.LastIncludedTerm)
+
+	rf.LastIncludedIndex = args.LastIncludedIndex
+	rf.LastIncludedTerm = args.LastIncludedTerm
+
+	rf.CommitIndex = labutil.Max(rf.CommitIndex, rf.LastIncludedIndex)
+
+	//上面已经判断LastIncludedIndex > LastApplied了
+	rf.LastApplied = rf.LastIncludedIndex
+
+	defer func() {
+
+		rf.saveStateAndSnapshot(args.Data)
+
+		if rf.CommitTrigger != nil {
+			// going to send snapshot to service
+			// CANNOT lose this trigger signal, MUST wait channel sending done,
+			// so cannot use select-default scheme
+			//go是如何实现等待channel发送完成的呢？
+
+			go func(ch chan<- bool) { ch <- false }(rf.CommitTrigger)
+			// upon received a snapshot, must notify upper-level service ASAP,
+			// before ANY new commit signal,
+			// so set commitTrigger to nil to block other goroutines from sending to this channel.
+			// committer will re-enable this channel once it start to process snapshot and send back to upper-level service
+			rf.CommitTrigger = nil
+		}
+	}()
+
+	for i := range rf.Log {
+		if rf.Log[i].Index == args.LastIncludedIndex && rf.Log[i].Term == args.LastIncludedTerm {
+			// if existing log entry has same index and term as snapshot's last included entry,
+			// retain log entries following it and reply
+			rf.Log = rf.Log[i+1:]
+			lablog.Debug(rf.me, lablog.Snap, "Retain log after index: %d term: %d, remain %d logs", args.LastIncludedIndex, args.LastIncludedTerm, len(rf.Log))
+			return
+		}
+	}
+
+	// discard the entire log
+	rf.Log = make([]LogEntry, 0)
+}
+func (rf *Raft) snapshoter(triggerCh <-chan bool) {
+	//只保留最近的一次snapshot
+	var index int
+	var snapshot []byte
+	//go语言 channel本质上是一个指针，所以这里的snapshotCh是一个指针
+
+	cmdCh := rf.SnapshotCh
+
+	for !rf.killed() {
+		select {
+		case cmd := <-cmdCh:
+			index, snapshot = cmd.Index, cmd.Snapshot
+		case _, ok := <-triggerCh:
+			if !ok {
+				return
+			}
+
+		}
+		rf.mu.Lock()
+		shouldSuspend := rf.shouldSuspendSnapshot(index)
+
+		if cmdCh == nil {
+			//对于leader来说需要暂停保存快照就不需要cmdCh
+			if shouldSuspend {
+				rf.mu.Unlock()
+				continue
+			}
+
+			//准备好接受新的snapshot command
+			cmdCh = rf.SnapshotCh
+		}
+
+		switch {
+		case index <= rf.LastIncludedIndex: //目前snapshot的index比已经保存的还要小，那么就不用保存了,已经过时了
+		case shouldSuspend:
+			cmdCh = nil
+		default:
+			rf.LastIncludedTerm = rf.Log[index-rf.LastIncludedIndex-1].Term
+			rf.Log = rf.Log[index-rf.LastIncludedIndex-1+1:]
+			rf.LastIncludedIndex = index
+
+			rf.saveStateAndSnapshot(snapshot)
+
+		}
+		rf.mu.Unlock()
+	}
+
+}
+
+// 针对snapshot的优化，希望当leader和follower的log差距不大时，就不保存新的snapshot
+func (rf *Raft) shouldSuspendSnapshot(index int) (r bool) {
+	r = false
+	if rf.State != LEADER {
+		return
+	}
+	for i := range rf.peers {
+		if distance := rf.NextIndex[i] - index; distance > 0 && distance < leaderKeepLogAmount {
+			r = true
+			break
+		}
+	}
+	return
+}
+func (rf *Raft) saveStateAndSnapshot(snapshot []byte) {
+	if data := rf.raftState(); data == nil {
+		lablog.Debug(rf.me, lablog.Error, "Write snapshot failed")
+	} else {
+		lastLogIndex, lastLogTerm := rf.lastLogIndexAndTerm()
+		lablog.Debug(rf.me, lablog.Snap, "Saved state: T:%d VF:%d, (LII:%d LIT:%d), (LLI:%d LLT:%d) and snapshot", rf.CurrentTerm, rf.VotedFor, rf.LastIncludedIndex, rf.LastIncludedTerm, lastLogIndex, lastLogTerm)
+		rf.persister.SaveStateAndSnapshot(data, snapshot)
+	}
 }
