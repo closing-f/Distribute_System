@@ -1,9 +1,18 @@
+/*
+ * @Author: closing
+ * @Date: 2023-04-15 21:17:40
+ * @LastEditors: closing
+ * @LastEditTime: 2023-06-03 15:36:27
+ * @Description: 请填写简介
+ */
 package kvraft
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongLeader  = "ErrWrongLeader"
+	ErrShutdown     = "ErrShutdown"
+	ErrInitElection = "ErrInitElection"
 )
 
 type Err string
@@ -16,6 +25,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId int64 // id of client
+	OpId     int   // client operation id
 }
 
 type PutAppendReply struct {
@@ -25,6 +36,8 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ClientId int64 // id of client
+	OpId     int   // client operation id
 }
 
 type GetReply struct {

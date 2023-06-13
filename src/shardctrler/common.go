@@ -1,3 +1,10 @@
+/*
+ * @Author: closing
+ * @Date: 2023-04-15 21:17:40
+ * @LastEditors: closing
+ * @LastEditTime: 2023-06-12 21:27:21
+ * @Description: 请填写简介
+ */
 package shardctrler
 
 //
@@ -28,46 +35,53 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
-const (
-	OK = "OK"
-)
-
 type Err string
 
+const (
+	OK              Err = "OK"
+	ErrWrongLeader  Err = "ErrWrongLeader"
+	ErrShutdown     Err = "ErrShutdown"
+	ErrInitElection Err = "ErrInitElection"
+)
+
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers  map[int][]string // new GID -> servers mappings
+	ClientId int64
+	OpId     int
 }
 
 type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs     []int
+	ClientId int64
+	OpId     int
 }
 
 type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard    int
+	GID      int
+	ClientId int64
+	OpId     int
 }
 
 type MoveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num      int // desired config number
+	ClientId int64
+	OpId     int
 }
 
 type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
 }

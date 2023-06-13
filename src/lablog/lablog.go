@@ -1,3 +1,10 @@
+/*
+ * @Author: closing
+ * @Date: 2023-04-15 21:17:40
+ * @LastEditors: closing
+ * @LastEditTime: 2023-06-03 21:39:40
+ * @Description: 请填写简介
+ */
 package lablog
 
 import (
@@ -59,6 +66,20 @@ func init() {
 }
 
 func Debug(serverId int, topic LogTopic, format string, a ...interface{}) {
+	if debugVerbosity == 2 && topic != Log && topic != Heart {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		if serverId >= 0 {
+			prefix += fmt.Sprintf("S%d ", serverId)
+		}
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+
+}
+
+func KVDebug(serverId int, topic LogTopic, format string, a ...interface{}) {
 	if debugVerbosity == 0 && topic != Log && topic != Heart {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
