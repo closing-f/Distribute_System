@@ -14,11 +14,10 @@ import (
 )
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// Your data here.
-	me     int64 // client id
-	leader int   // leader id
-	opId   int   // operation id,单调递增
+	servers []*labrpc.ClientEnd //多服务器群
+	me      int64               // client id
+	leader  int                 // leader id
+	opId    int                 // operation id,单调递增
 }
 
 func nrand() int64 {

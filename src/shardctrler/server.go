@@ -2,7 +2,7 @@
  * @Author: closing
  * @Date: 2023-04-15 21:17:40
  * @LastEditors: closing
- * @LastEditTime: 2023-06-13 10:31:19
+ * @LastEditTime: 2023-06-13 15:53:57
  * @Description: 请填写简介
  */
 package shardctrler
@@ -414,6 +414,7 @@ func (sc *ShardCtrler) applier(applyCh <-chan raft.ApplyMsg, snapshotTrigger cha
 		sc.mu.Unlock()
 
 		if ok {
+			//TODO 什么时候会不同？
 			if ce.op.ClientId != op.ClientId || ce.op.OpId != op.OpId {
 				ce.replyCh <- applyResult{Err: ErrWrongLeader}
 			} else {
